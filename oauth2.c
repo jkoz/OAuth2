@@ -4,6 +4,8 @@
 #include <assert.h>
 #include <curl/curl.h>
 #include <yajl/yajl_tree.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 typedef enum
 {
@@ -51,6 +53,7 @@ typedef struct _oauth2_context
     char* code; /* confirmation code */
     char* auth_code; /* access_token */
     char* refresh_token; /* refresh_token if any */
+    int expires_in;
     char* inf;
     oauth2_error last_error;
 } oauth2_context;
@@ -70,8 +73,8 @@ void oauth2_set_auth_code(oauth2_context* contex, char* auth_code);
 //Returns URL to redirect user to.
 void oauth2_request_auth_code(oauth2_context* conf);
 char* oauth2_access_auth_code(oauth2_context* conf);
-char* oauth2_access_refresh_token(oauth2_context* conf, char* refresh_token);
-char* oauth2_request(oauth2_context* conf, char* uri, char* params);  
+void oauth2_access_refresh_token(oauth2_context* conf);
+char* oauth2_request(oauth2_context* conf, char* uri, char* params);
 void oauth2_cleanup(oauth2_context* conf);
 static void oauth2_parse_conf(oauth2_context*);
 
@@ -92,7 +95,7 @@ size_t curl_callback(void *ptr, size_t size, size_t nmemb, void *userdata)
     size_t max;
     data* d;
     data* nd;
-    
+
     d = (data*)userdata;
 
     idx = 0;
@@ -179,7 +182,7 @@ char* curl_make_request(char* url, char* params)
 
     //Allocate storage
     retVal = malloc(sizeof(char)*data_len);
-    
+
     //Now copy in the data
     curr_storage = storage;
     data_len = 0;
@@ -192,7 +195,7 @@ char* curl_make_request(char* url, char* params)
     //Cleanup
     curl_easy_cleanup(handle);
     data_clean(storage);
-    
+
     return retVal;
 }
 
@@ -281,8 +284,6 @@ void oauth2_request_auth_code(oauth2_context* ctx)
     scanf("%s", code);
 
     oauth2_set_code(ctx, code);
-
-    return final_str;
 }
 
 static void oauth2_parse_conf(oauth2_context* ctx) {
@@ -300,19 +301,35 @@ static void oauth2_parse_conf(oauth2_context* ctx) {
         else
             fprintf(stderr, "unknown error");
         fprintf(stderr, "\n");
-        return NULL;
     }
 
     const char * path[] = { "access_token", (const char *) 0 };
     yajl_val v = yajl_tree_get(node, path, yajl_t_string);
     if (v) {
         ctx->auth_code = strdup(YAJL_GET_STRING(v));
-
-        printf("%s", ctx->auth_code);
-
+        /*printf("%s", ctx->auth_code);*/
     }
     else
-        printf("No such node: %s/%s\n", path[0], path[1]);
+        printf("No such node: %s\n", path[0]);
+
+    /*refresh_token*/
+    const char * path_rt[] = { "refresh_token", (const char *) 0 };
+    yajl_val v_rt = yajl_tree_get(node, path_rt, yajl_t_string);
+    if (v_rt) {
+        ctx->refresh_token = strdup(YAJL_GET_STRING(v_rt));
+        /*printf("%s", ctx->refresh_token);*/
+    }
+    else
+        printf("No such node: %s\n", path_rt[0]);
+
+    /*expires_in*/
+    const char * path_ei[] = { "expires_in", (const char *) 0 };
+    yajl_val v_ei = yajl_tree_get(node, path_ei, yajl_t_number);
+    if (v_ei) {
+        ctx->expires_in = YAJL_GET_INTEGER(v_ei);
+    }
+    else
+        printf("No such node: %s\n", path_rt[0]);
 
     yajl_tree_free(node);
 }
@@ -346,10 +363,31 @@ char* oauth2_access_auth_code(oauth2_context* ctx)
 }
 
 
-char* oauth2_access_refresh_token(oauth2_context* conf, char* refresh_token)
+void oauth2_access_refresh_token(oauth2_context* ctx)
 {
-    assert(0);
-    return NULL;
+
+    //Build up the request
+    char* uri;
+    char* query_fmt;
+    char* output;
+    int query_len;
+
+    assert(ctx->conf != NULL);
+    assert(ctx->conf->token_server != NULL);
+    assert(ctx->refresh_token != NULL);
+
+    query_fmt = "grant_type=refresh_token&client_id=%s&client_secret=%s&refresh_token=%s";
+
+    query_len = snprintf(NULL, 0, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->refresh_token);
+    uri = malloc(sizeof(char)*query_len);
+    sprintf(uri, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->refresh_token);
+
+    output = curl_make_request(ctx->conf->token_server, uri);
+    free(uri);
+
+    /*printf("Response from server: %s\n", output);*/
+
+    oauth2_set_inf(ctx, output);
 }
 
 char* oauth2_request(oauth2_context* ctx, char* uri, char* params)
@@ -357,7 +395,7 @@ char* oauth2_request(oauth2_context* ctx, char* uri, char* params)
     //For now, we'll just include the access code with the request vars
     //This is discouraged, but I don't know if most providers actually
     //support the header-field method (Facebook is still at draft 0...)
-    
+
     char* retVal;
     char* uri2;
     int uri_len;
@@ -367,7 +405,7 @@ char* oauth2_request(oauth2_context* ctx, char* uri, char* params)
     assert(ctx->conf->client_id != NULL);
     assert(ctx->auth_code != NULL);
     assert(uri != NULL);
-    
+
     //Are we POSTing?
     if(params != NULL)
     {
@@ -420,6 +458,40 @@ int main(int argc, char** argv)
         sprintf(ctx->inf, buffer);
 
         oauth2_parse_conf(ctx);
+        struct stat attr;
+        stat(pat, &attr);
+
+        int s = time(0) - attr.st_mtime;
+
+        if (s > ctx->expires_in ) {
+
+            oauth2_access_refresh_token(ctx);
+
+            char errbuf[1024];
+            errbuf[0] = 0;
+
+            /* we have the whole config file in memory.  let's parse it ... */
+            yajl_val node = yajl_tree_parse((const char *) ctx->inf, errbuf, sizeof(errbuf));
+
+            /* parse error handling */
+            if (node == NULL) {
+                fprintf(stderr, "parse_error: ");
+                if (strlen(errbuf))
+                    fprintf(stderr, " %s", errbuf);
+                else
+                    fprintf(stderr, "unknown error");
+                fprintf(stderr, "\n");
+            }
+
+            const char * path[] = { "access_token", (const char *) 0 };
+            yajl_val v = yajl_tree_get(node, path, yajl_t_string);
+            if (v) {
+                ctx->auth_code = strdup(YAJL_GET_STRING(v));
+                /*printf("%s", ctx->auth_code);*/
+            }
+            else
+                printf("No such node: %s\n", path[0]);
+        }
     } else {
         oauth2_request_auth_code(ctx); /* prompt for URI to get code */
         oauth2_access_auth_code(ctx); /* get the code to request access_token*/
@@ -431,6 +503,9 @@ int main(int argc, char** argv)
         else
             fprintf(f, ctx->inf);
     }
+
+    printf("%s", ctx->auth_code);
+
     free(pat);
 
     if (f != NULL)
