@@ -1,7 +1,7 @@
 include config.mk
 
 PROG = oauth2
-SRC = oauth2.c
+SRC = oauth2.c curl_request.c
 OBJ = ${SRC:.c=.o}
 
 all: ${PROG}

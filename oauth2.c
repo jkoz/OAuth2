@@ -2,10 +2,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include <curl/curl.h>
+#include <time.h>
 #include <yajl/yajl_tree.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include "curl_request.h"
 
 typedef enum
 {
@@ -38,6 +39,7 @@ typedef struct _oauth2_error {
 
 typedef struct _oauth2_config
 {
+    char* user;
     char* auth_server;
     char* token_server;
     char* client_id;
@@ -64,7 +66,6 @@ typedef struct _oauth2_context
 
 //Initialiser
 
-//Set the redirect URI for auth code authentication. This must be set before using oauth2_request_auth_code too.
 oauth2_context* create_context(oauth2_config* conf);
 void oauth2_set_code(oauth2_context* contex, char* code);
 void oauth2_set_inf(oauth2_context* contex, char* inf);
@@ -72,132 +73,16 @@ void oauth2_set_auth_code(oauth2_context* contex, char* auth_code);
 
 //Returns URL to redirect user to.
 void oauth2_request_auth_code(oauth2_context* conf);
-char* oauth2_access_auth_code(oauth2_context* conf);
+void oauth2_request_access_token(oauth2_context* conf);
+
+char* oauth2_create_auth_uri(oauth2_context* conf);
+char* oauth2_create_access_token_uri(oauth2_context* conf);
+char* oauth2_create_refresh_token_uri(oauth2_context* conf);
+
 void oauth2_access_refresh_token(oauth2_context* conf);
 char* oauth2_request(oauth2_context* conf, char* uri, char* params);
 void oauth2_cleanup(oauth2_context* conf);
 static void oauth2_parse_conf(oauth2_context*);
-
-#define MAX_BUFFER 2048 //2KB Buffers
-
-typedef struct _data {
-    char d[MAX_BUFFER];
-    struct _data* next;
-    int idx;
-} data;
-
-char* curl_make_request(char* url, char* params);
-
-
-size_t curl_callback(void *ptr, size_t size, size_t nmemb, void *userdata)
-{
-    size_t idx;
-    size_t max;
-    data* d;
-    data* nd;
-
-    d = (data*)userdata;
-
-    idx = 0;
-    max = nmemb * size;
-
-    //Scan to the correct buffer
-    while(d->next != NULL)
-        d = d->next;
-
-    //Store the data
-    while(idx < max)
-    {
-        d->d[d->idx++] = ((char*)ptr)[idx++];
-
-        if(d->idx == MAX_BUFFER)
-        {
-            nd = malloc(sizeof(data));
-            nd->next = NULL;
-            nd->idx = 0;
-            d->next = nd;
-            d = nd;
-        }
-    }
-
-    return max;
-}
-
-void data_clean(data* d)
-{
-    data* pd;
-    while(d)
-    {
-        pd = d->next;
-        free(d);
-        d = pd;
-    }
-}
-
-char* curl_make_request(char* url, char* params)
-{
-    data* storage;
-    data* curr_storage;
-    CURL* handle;
-    int data_len;
-    char* retVal;
-
-    assert(url != 0);
-    assert(*url != 0);
-
-    storage = malloc(sizeof(data));
-    storage->idx = 0;
-    storage->next = 0;
-
-    handle = curl_easy_init();
-    curl_easy_setopt(handle, CURLOPT_URL, url);
-    curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curl_callback);
-    curl_easy_setopt(handle, CURLOPT_WRITEDATA, storage);
-
-    //Do we need to add the POST parameters?
-    if(params != NULL)
-    {
-        curl_easy_setopt(handle, CURLOPT_POST, 1);
-        curl_easy_setopt(handle, CURLOPT_COPYPOSTFIELDS, params); //Copy them just incase
-                                                                  //the user does something stupid
-    }
-
-    if(curl_easy_perform(handle) != 0)
-    {
-        //Error!
-        curl_easy_cleanup(handle);
-        data_clean(storage);
-        return NULL;
-    }
-
-    //Everything went OK.
-    //How long is the data?
-    data_len = 0;
-    curr_storage = storage;
-    while(curr_storage)
-    {
-        data_len += curr_storage->idx;
-        curr_storage = curr_storage->next;
-    }
-
-    //Allocate storage
-    retVal = malloc(sizeof(char)*data_len);
-
-    //Now copy in the data
-    curr_storage = storage;
-    data_len = 0;
-    while(curr_storage)
-    {
-        memcpy(retVal+data_len, curr_storage->d, curr_storage->idx);
-        curr_storage = curr_storage->next;
-    }
-
-    //Cleanup
-    curl_easy_cleanup(handle);
-    data_clean(storage);
-
-    return retVal;
-}
 
 oauth2_context* create_context(oauth2_config* conf) {
      oauth2_context* contex = malloc(sizeof(oauth2_context));
@@ -238,30 +123,17 @@ void oauth2_set_auth_code(oauth2_context* ctx, char* auth_code)
     strcpy(ctx->auth_code, auth_code);
 }
 
-void oauth2_request_auth_code(oauth2_context* ctx)
-{
-    int core_len;
-    int scope_len;
-    int state_len;
-    char* core_fmt;
-    char* scope_fmt;
-    char* state_fmt;
+char* oauth2_create_auth_uri(oauth2_context* ctx) {
+    int scope_len = 1;
+    int state_len = 1;
     char* final_str;
 
-    scope_len = 1;
-    state_len = 1;
-
-    assert(ctx != NULL);
-
-    //We just need to build the request string, since we can't actually handle the callback ourselves
-    //URL Format: <server>?response_type=code&client_id=<client_id>&redirect_uri=<redir_uri>&scope=<scope>&state=<state>
-    //Get the final length
-    core_fmt = "%s?response_type=code&client_id=%s&redirect_uri=%s";
-    scope_fmt = "&scope=%s";
-    state_fmt = "&state=%s";
+    char* core_fmt = "%s?response_type=code&client_id=%s&redirect_uri=%s";
+    char* scope_fmt = "&scope=%s";
+    char* state_fmt = "&state=%s";
 
     //Get the string lengths
-    core_len = snprintf(NULL, 0, (const char*)core_fmt, ctx->conf->auth_server, ctx->conf->client_id, ctx->conf->redirect_uri) + 1;
+    int core_len = snprintf(NULL, 0, (const char*)core_fmt, ctx->conf->auth_server, ctx->conf->client_id, ctx->conf->redirect_uri) + 1;
     if(ctx->conf->scope != NULL)
         scope_len = snprintf(NULL, 0, (const char*)scope_fmt, ctx->conf->scope) + 1;
     if(ctx->conf->state != NULL)
@@ -273,16 +145,21 @@ void oauth2_request_auth_code(oauth2_context* ctx)
     sprintf(final_str, (const char*)core_fmt, ctx->conf->auth_server, ctx->conf->client_id, ctx->conf->redirect_uri);
     if(ctx->conf->scope != NULL)
         sprintf((char*)(final_str+(core_len-1)), (const char*)scope_fmt, ctx->conf->scope);
-
     if(ctx->conf->state != NULL)
         sprintf((char*)(final_str+(core_len-1)+(scope_len-1)), (const char*)state_fmt, ctx->conf->state);
+    return final_str;
+}
 
+void oauth2_request_auth_code(oauth2_context* ctx)
+{
+
+    char* final_str = oauth2_create_auth_uri(ctx);
     printf("Visit this url and hit authorize: %s\n", final_str);
     printf("Now put the auth token here: ");
+    free(final_str);
 
     char code[255];
     scanf("%s", code);
-
     oauth2_set_code(ctx, code);
 }
 
@@ -334,60 +211,46 @@ static void oauth2_parse_conf(oauth2_context* ctx) {
     yajl_tree_free(node);
 }
 
-char* oauth2_access_auth_code(oauth2_context* ctx)
-{
-    //Build up the request
-    char* uri;
-    char* query_fmt;
-    char* output;
-    int query_len;
+char* oauth2_create_access_token_uri(oauth2_context* ctx) {
+    char* query_fmt = "grant_type=authorization_code&client_id=%s&client_secret=%s&code=%s&redirect_uri=%s";
+    int query_len = snprintf(NULL, 0, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->code, ctx->conf->redirect_uri);
+    char* uri = malloc(sizeof(char)*query_len);
+    sprintf(uri, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->code, ctx->conf->redirect_uri);
+    return uri;
+}
 
+void oauth2_request_access_token(oauth2_context* ctx)
+{
     assert(ctx->conf != NULL);
     assert(ctx->conf->token_server != NULL);
     assert(ctx->code != NULL);
 
-    query_fmt = "grant_type=authorization_code&client_id=%s&client_secret=%s&code=%s&redirect_uri=%s";
-
-    query_len = snprintf(NULL, 0, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->code, ctx->conf->redirect_uri);
-    uri = malloc(sizeof(char)*query_len);
-    sprintf(uri, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->code, ctx->conf->redirect_uri);
-
-    output = curl_make_request(ctx->conf->token_server, uri);
+    char* uri = oauth2_create_access_token_uri(ctx);
+    /*printf("\n\nUsing: %s/%s\n\n", ctx->conf->token_server, uri );*/
+    oauth2_set_inf(ctx, curl_make_request(ctx->conf->token_server, uri));
     free(uri);
-
-    /*printf("Response from server: %s\n", output);*/
-
-    oauth2_set_inf(ctx, output);
-
-    return NULL;
 }
 
+char* oauth2_create_refresh_token_uri(oauth2_context* ctx) {
+    char* query_fmt = "grant_type=refresh_token&client_id=%s&client_secret=%s&refresh_token=%s";
+    int query_len = snprintf(NULL, 0, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->refresh_token);
+    char* uri = malloc(sizeof(char)*query_len);
+    sprintf(uri, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->refresh_token);
+    return uri;
+}
 
 void oauth2_access_refresh_token(oauth2_context* ctx)
 {
-
-    //Build up the request
-    char* uri;
-    char* query_fmt;
-    char* output;
-    int query_len;
-
     assert(ctx->conf != NULL);
     assert(ctx->conf->token_server != NULL);
     assert(ctx->refresh_token != NULL);
 
-    query_fmt = "grant_type=refresh_token&client_id=%s&client_secret=%s&refresh_token=%s";
-
-    query_len = snprintf(NULL, 0, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->refresh_token);
-    uri = malloc(sizeof(char)*query_len);
-    sprintf(uri, query_fmt, ctx->conf->client_id, ctx->conf->client_secret, ctx->refresh_token);
-
-    output = curl_make_request(ctx->conf->token_server, uri);
+    char* uri = oauth2_create_refresh_token_uri(ctx);
+    char* out = curl_make_request(ctx->conf->token_server, uri);
+    oauth2_set_inf(ctx, out);
     free(uri);
 
-    /*printf("Response from server: %s\n", output);*/
-
-    oauth2_set_inf(ctx, output);
+    /*printf("Response from server: %s\n", out);*/
 }
 
 char* oauth2_request(oauth2_context* ctx, char* uri, char* params)
@@ -428,7 +291,6 @@ void oauth2_cleanup(oauth2_context* ctx)
 {
     if(ctx == NULL)
         return;
-
     if (ctx->auth_code != NULL)
         free(ctx->auth_code);
     if (ctx->code != NULL)
@@ -438,16 +300,15 @@ void oauth2_cleanup(oauth2_context* ctx)
     free(ctx);
 }
 
-int main(int argc, char** argv)
-{
-    oauth2_context* ctx = create_context(&conf[0]);
+void run(oauth2_config *conf) {
+    oauth2_context* ctx = create_context(conf);
 
     FILE *f;
 
     int uri_len;
-    uri_len = snprintf(NULL, 0, "/home/tait/.cache/oauth_%s", ctx->conf->client_id);
+    uri_len = snprintf(NULL, 0, "/home/tait/.cache/oauth_%s", ctx->conf->user);
     char* pat = malloc(sizeof(char)*uri_len);
-    sprintf(pat, "/home/tait/.cache/oauth_%s", ctx->conf->client_id);
+    sprintf(pat, "/home/tait/.cache/oauth_%s", ctx->conf->user);
     f = fopen(pat, "r+");
 
     if (f != NULL) { /* there is cache*/
@@ -465,7 +326,7 @@ int main(int argc, char** argv)
 
         if (s > ctx->expires_in ) {
 
-            oauth2_access_refresh_token(ctx);
+            oauth2_access_refresh_token(ctx); /* request for access_token based on refresh_token*/
 
             char errbuf[1024];
             errbuf[0] = 0;
@@ -487,14 +348,13 @@ int main(int argc, char** argv)
             yajl_val v = yajl_tree_get(node, path, yajl_t_string);
             if (v) {
                 ctx->auth_code = strdup(YAJL_GET_STRING(v));
-                /*printf("%s", ctx->auth_code);*/
             }
             else
                 printf("No such node: %s\n", path[0]);
         }
     } else {
         oauth2_request_auth_code(ctx); /* prompt for URI to get code */
-        oauth2_access_auth_code(ctx); /* get the code to request access_token*/
+        oauth2_request_access_token(ctx); /* get the code to request access_token*/
         oauth2_parse_conf(ctx);
 
         f = fopen(pat, "w");
@@ -512,6 +372,42 @@ int main(int argc, char** argv)
         fclose(f);
 
     oauth2_cleanup(ctx);
+}
 
-    return 0;
+
+static void usage(const char * progname)
+{
+    fprintf(stderr,
+            "usage:  %s [options]\n"
+            "Parse input from stdin as JSON and ouput parsing details "
+                                                          "to stdout\n"
+            "   -b  set the read buffer size\n"
+            "   -c  allow comments\n"
+            "   -g  allow *g*arbage after valid JSON text\n"
+            "   -m  allows the parser to consume multiple JSON values\n"
+            "       from a single string separated by whitespace\n"
+            "   -p  partial JSON documents should not cause errors\n",
+            progname);
+    exit(1);
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        fprintf(stderr,"No arguments given, do nothing\n");
+        return 0;
+    }
+
+    int i;
+    int len = sizeof(conf)/sizeof(conf[0]);
+    for (i = 0; i < len; i++) {
+        /*printf("Compare %s and %s\n", argv[1], conf[i].user);*/
+        if (strcmp(argv[1], conf[i].user) == 0) {
+            /*printf("Getting token for %s...\n", conf[i].user);*/
+            run(&conf[i]);
+            return 0;
+        }
+    }
+
+    return 1;
 }
