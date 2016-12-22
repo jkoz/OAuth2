@@ -1,6 +1,7 @@
 // should be const
 static struct _oauth2_config conf[] = {
 	{
+		"abc@gmail.com",
 		"https://accounts.google.com/o/oauth2/auth", /* auth_server */
 		"https://accounts.google.com/o/oauth2/token", /* token_server */
 		"", /* client id */
