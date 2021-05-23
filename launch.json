@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug OAuth2",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/oauth2",
+            "args": [ "phuoctaitp@gmail.com"],
+            "env": { "HOME": "/Users/taitran" },
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
+        }
+    ]
+}
